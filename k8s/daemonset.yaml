@@ -24,7 +24,7 @@ spec:
         key: node-role.kubernetes.io/master
       containers:
       - name: tracer
-        image: classikh/http-tracer:v1
+        image: classikh/http-tracer:v3
         imagePullPolicy: Always
         securityContext:
           privileged: true

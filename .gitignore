@@ -1,0 +1,35 @@
+# Binaries and Build Artifacts
+bin/
+*.exe
+*.test
+*.prof
+*.o
+
+# Development and Local Configuration
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+*.log
+
+# Go
+vendor/
+go.work
+go.work.sum
+
+# eBPF Generated Files
+# Generated vmlinux.h
+ebpf/headers/vmlinux.h
+# Generated Go bindings (cilium/ebpf convention usually produces these)
+*_bpfel.go
+*_bpfeb.go
+*_bpfel.o
+*_bpfeb.o
+
+# Specific clean targets from Makefile
+cmd/tracer/bpf_*
+cmd/tracer-tp/bpf_*
+
+# Temporary directories
+tmp/

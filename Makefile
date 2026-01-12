@@ -14,7 +14,7 @@ generate:
 	@go generate ./cmd/tracer
 
 # Build the binary
-build:
+build: generate
 	@echo "Building binary..."
 	@go build -o bin/http-tracer ./cmd/tracer
 
@@ -31,11 +31,11 @@ run: build
 
 
 image: 
-	@docker build -t classikh/http-tracer:v1 .
+	@docker build -t classikh/http-tracer:v3 .
 
 
 push: image
-	@docker push classikh/http-tracer:v1
+	@docker push classikh/http-tracer:v3
 
 deploy: 
 	@kubectl apply -f k8s/serviceaccount.yaml
@@ -56,4 +56,4 @@ test-ew:
 	kubectl run test-pod --image=curlimages/curl --rm -it --restart=Never -- curl http://httpbin.default.svc.cluster.local/get
 
 test-ns:
-	kubectl run test-pod --image=curlimages/curl --rm -it --restart=Never -- curl http://example.com
+	kubectl run test-pod --image=curlimages/curl --rm -it --restart=Never -- curl http://google.com
