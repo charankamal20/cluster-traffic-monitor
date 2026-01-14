@@ -134,3 +134,12 @@ func (w *Watcher) GetPodByIP(ip string) *PodInfo {
 	}
 	return nil
 }
+
+// GetPodURI returns a friendly string "namespace/podname" for an IP
+func (w *Watcher) GetPodURI(ip string) string {
+	info := w.GetPodByIP(ip)
+	if info == nil {
+		return ip // Fallback to IP if unknown
+	}
+	return fmt.Sprintf("%s/%s", info.Namespace, info.Name)
+}

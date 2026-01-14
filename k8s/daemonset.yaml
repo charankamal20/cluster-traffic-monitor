@@ -24,7 +24,7 @@ spec:
         key: node-role.kubernetes.io/master
       containers:
       - name: tracer
-        image: classikh/http-tracer:v3
+        image: classikh/http-tracer:v6
         imagePullPolicy: Always
         securityContext:
           privileged: true
@@ -50,6 +50,8 @@ spec:
         - name: cgroup
           mountPath: /sys/fs/cgroup
           readOnly: true
+        - name: traces
+          mountPath: /var/log/http-tracer
       volumes:
       - name: bpffs
         hostPath:
@@ -63,3 +65,7 @@ spec:
         hostPath:
           path: /sys/fs/cgroup
           type: Directory
+      - name: traces
+        hostPath:
+          path: /var/log/http-tracer
+          type: DirectoryOrCreate

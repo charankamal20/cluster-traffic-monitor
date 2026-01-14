@@ -13,9 +13,12 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charankamal20/cluster-traffic-monitor/internal/events"
+	"github.com/charankamal20/cluster-traffic-monitor/internal/filter"
 	"github.com/charankamal20/cluster-traffic-monitor/internal/k8s"
+	"github.com/charankamal20/cluster-traffic-monitor/internal/output"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -106,6 +109,23 @@ func run(ctx context.Context) error {
 		rd.Close()
 	}()
 
+	// Initialize components
+	filterer := filter.NewFilterer()
+
+	// Create output directory if not exists
+	logDir := "/var/log/http-tracer"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Printf("Warning: Could not create log dir, falling back to local: %v", err)
+		logDir = "."
+	}
+	writer, err := output.NewFileWriter(fmt.Sprintf("%s/traces.log", logDir))
+	if err != nil {
+		log.Fatalf("Failed to initialize file writer: %v", err)
+	}
+	defer writer.Close()
+
+	log.Printf("Writing traces to %s/traces.log", logDir)
+
 	for {
 		record, err := rd.Read()
 		if err != nil {
@@ -123,87 +143,92 @@ func run(ctx context.Context) error {
 			continue
 		}
 
-		// --- Simple Reassembly & Parsing (Stateless for now, assumes headers in one chunk) ---
-		// In a real production system, we would buffer chunks by Flow ID (PID+TID+Socket).
-		// For this demo, we assume the first chunk often contains headers and print them.
-
-		processChunk(chunk, watcher)
+		processChunk(chunk, watcher, filterer, writer)
 	}
 }
 
-func processChunk(chunk *events.DataEvent, watcher *k8s.Watcher) {
+func processChunk(chunk *events.DataEvent, watcher *k8s.Watcher, filterer *filter.Filterer, writer *output.FileWriter) {
 	// Try to detect HTTP
 	data := string(chunk.Payload)
 	isReq := false
 	isResp := false
 
 	if strings.HasPrefix(data, "GET ") || strings.HasPrefix(data, "POST ") ||
-		strings.HasPrefix(data, "PUT ") || strings.HasPrefix(data, "DELETE ") {
+		strings.HasPrefix(data, "PUT ") || strings.HasPrefix(data, "DELETE ") ||
+		strings.HasPrefix(data, "PATCH ") || strings.HasPrefix(data, "HEAD ") {
 		isReq = true
 	} else if strings.HasPrefix(data, "HTTP/") {
 		isResp = true
 	}
 
 	if !isReq && !isResp {
-		return // Skip non-HTTP chunks (bodies without headers in this simple version)
+		return // Skip non-HTTP chunks
 	}
 
-	// Enrich with K8s info
-	srcPod := watcher.GetPodByIP(chunk.SrcIPString())
-	dstPod := watcher.GetPodByIP(chunk.DstIPString())
-
-	srcLabel := chunk.SrcIPString()
-	if srcPod != nil {
-		srcLabel = fmt.Sprintf("%s/%s (%s)", srcPod.Namespace, srcPod.Name, srcPod.IP)
-	}
-	dstLabel := chunk.DstIPString()
-	if dstPod != nil {
-		dstLabel = fmt.Sprintf("%s/%s (%s)", dstPod.Namespace, dstPod.Name, dstPod.IP)
-	}
-
-	// Parse Headers
 	buf := bytes.NewReader(chunk.Payload)
 	bufferedReader := bufio.NewReader(buf)
 
-	fmt.Println("----------------------------------------------------------------")
+	var entry output.TraceEntry
+	entry.Timestamp = time.Now() // Approximate, ideally use chunk timestamp + boot time
+
+	// --- IP FILTERING ---
+	srcIP := chunk.SrcIPString()
+	dstIP := chunk.DstIPString()
+	if !filterer.ShouldTraceConnection(srcIP, dstIP) {
+		return
+	}
+
+	entry.Src = watcher.GetPodURI(srcIP)
+	entry.Dst = watcher.GetPodURI(dstIP)
+
 	if isReq {
 		req, err := http.ReadRequest(bufferedReader)
 		if err != nil {
-			fmt.Printf("Parsed PARTIAL Request from %s -> %s\n", srcLabel, dstLabel)
-			fmt.Println(data) // Fallback to printing raw
-		} else {
-			fmt.Printf("HTTP REQUEST: %s %s\n", req.Method, req.URL)
-			fmt.Printf("From: %s\nTo:   %s\n", srcLabel, dstLabel)
-			fmt.Println("Headers:")
-			for k, v := range req.Header {
-				fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
-			}
-
-			// Print Body
-			bodyBytes, _ := io.ReadAll(req.Body)
-			if len(bodyBytes) > 0 {
-				fmt.Printf("\nBody (%d bytes):\n%s\n", len(bodyBytes), string(bodyBytes))
-			}
+			// Partial or malformed
+			return
 		}
+
+		// --- FILTERING ---
+		// Check path and User-Agent
+		if !filterer.ShouldTraceRequest(req.URL.Path, req.UserAgent()) {
+			return // Filtered out
+		}
+
+		entry.Type = "REQUEST"
+		entry.Method = req.Method
+		entry.URL = req.URL.String()
+		entry.Headers = make(map[string]string)
+		for k, v := range req.Header {
+			entry.Headers[k] = strings.Join(v, ", ")
+		}
+
+		// Body (simplified)
+		bodyBytes, _ := io.ReadAll(req.Body)
+		if len(bodyBytes) > 0 {
+			entry.Body = string(bodyBytes)
+		}
+
 	} else if isResp {
 		resp, err := http.ReadResponse(bufferedReader, nil)
 		if err != nil {
-			fmt.Printf("Parsed PARTIAL Response from %s -> %s\n", srcLabel, dstLabel)
-			fmt.Println(data)
-		} else {
-			fmt.Printf("HTTP RESPONSE: %s\n", resp.Status)
-			fmt.Printf("From: %s\nTo:   %s\n", srcLabel, dstLabel)
-			fmt.Println("Headers:")
-			for k, v := range resp.Header {
-				fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
-			}
+			return
+		}
 
-			// Print Body
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			if len(bodyBytes) > 0 {
-				fmt.Printf("\nBody (%d bytes):\n%s\n", len(bodyBytes), string(bodyBytes))
-			}
+		entry.Type = "RESPONSE"
+		entry.Status = resp.Status
+		entry.Headers = make(map[string]string)
+		for k, v := range resp.Header {
+			entry.Headers[k] = strings.Join(v, ", ")
+		}
+
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		if len(bodyBytes) > 0 {
+			entry.Body = string(bodyBytes)
 		}
 	}
-	fmt.Println("----------------------------------------------------------------")
+
+	// Write to file
+	if err := writer.Write(entry); err != nil {
+		log.Printf("Error writing trace: %v", err)
+	}
 }
