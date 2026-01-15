@@ -30,7 +30,7 @@ import (
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 bpf_full ../../ebpf/http_tracer_full.bpf.c -- -I/usr/include -I../../ebpf
 
 type dedupKey struct {
-	connKey   events.ConnectionKey
+	sockPtr   uint64 // ⭐ CHANGED: Use sock_ptr
 	isRequest bool
 	timestamp int64
 }
@@ -42,12 +42,15 @@ var (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 	slog.SetDefault(logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Dedup cache cleanup
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -82,6 +85,7 @@ func run(ctx context.Context) error {
 	if err := loadBpf_fullObjects(&objs, nil); err != nil {
 		return fmt.Errorf("loading eBPF objects: %w", err)
 	}
+
 	defer objs.Close()
 	slog.Info("eBPF objects loaded successfully")
 
@@ -97,6 +101,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("attaching sendmsg kprobe: %w", err)
 	}
+
 	defer kpSend.Close()
 	slog.Info("Kprobe tcp_sendmsg attached")
 
@@ -104,12 +109,14 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("attaching recvmsg kprobe: %w", err)
 	}
+
 	defer kpRecv.Close()
 
 	krRecv, err := link.Kretprobe("tcp_recvmsg", objs.KretprobeTcpRecvmsg, nil)
 	if err != nil {
 		return fmt.Errorf("attaching recvmsg kretprobe: %w", err)
 	}
+
 	defer krRecv.Close()
 	slog.Info("Kprobe/Kretprobe tcp_recvmsg attached")
 
@@ -117,8 +124,8 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("creating ring buffer reader: %w", err)
 	}
-	defer rd.Close()
 
+	defer rd.Close()
 	log.Println("✓ Ring buffer reader created")
 	log.Println("🔍 Listening for FULL HTTP traffic... (Ctrl+C to stop)")
 	log.Println()
@@ -143,6 +150,7 @@ func run(ctx context.Context) error {
 		slog.Error("Failed to initialize file writer", "error", err)
 		return fmt.Errorf("initializing file writer: %w", err)
 	}
+
 	defer writer.Close()
 	slog.Info("Writing traces to file", "path", fmt.Sprintf("%s/traces.log", logDir))
 
@@ -152,6 +160,7 @@ func run(ctx context.Context) error {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return nil
 			}
+
 			slog.Error("Error reading from ring buffer", "error", err)
 			continue
 		}
@@ -170,6 +179,7 @@ func run(ctx context.Context) error {
 		}
 
 		completeMessages := reassembler.AddChunk(streamKey, chunk.Payload, chunk.Direction)
+
 		for _, msgData := range completeMessages {
 			processCompleteMessage(msgData, chunk, watcher, filterer, writer, correlator)
 		}
@@ -177,23 +187,13 @@ func run(ctx context.Context) error {
 }
 
 func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.Watcher, filterer *filter.Filterer, writer *output.FileWriter, correlator *events.Correlator) {
-	// Only process egress to avoid duplicates
-	if chunk.Direction != 0 {
-		slog.Info("Got ingress request")
-		return
-	}
-
-	slog.Info("Got egress request")
-
 	isReq := false
 	isResp := false
 
-	// Robustness: Strip potential leading garbage (e.g. from BPF offset issues)
-	// We scan the first 128 bytes for a valid HTTP method or HTTP version.
-	// This helps recover traffic even if the captured chunk starts with random kernel bytes.
+	// Strip potential leading garbage
 	cleanData, garbageLen := stripGarbage(data)
 	if garbageLen > 0 {
-		slog.Warn("Stripped leading garbage from packet", "bytes", garbageLen, "garbage_hex", fmt.Sprintf("%x", data[:garbageLen]))
+		slog.Debug("Stripped leading garbage from packet", "bytes", garbageLen)
 		data = cleanData
 	}
 
@@ -207,27 +207,17 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 	}
 
 	if !isReq && !isResp {
-		slog.Info("Neither request nor response.")
-		// Log the first 50 bytes to debug what we are actually getting
-		peekLen := 50
-		if len(data) < peekLen {
-			peekLen = len(data)
-		}
-		slog.Info("Unknown data peek", "hex", fmt.Sprintf("%x", data[:peekLen]), "str", string(data[:peekLen]))
 		return
 	}
 
 	buf := bytes.NewReader(data)
 	bufferedReader := bufio.NewReader(buf)
-	var entry output.TraceEntry
-	entry.Timestamp = time.Now()
 
 	// TCP-level IPs
 	srcIP := chunk.SrcIPString()
 	dstIP := chunk.DstIPString()
 
 	if filterer.IsLoopbackTraffic(srcIP, dstIP) || !filterer.ShouldTraceIP(srcIP) || !filterer.ShouldTraceIP(dstIP) {
-		slog.Info("IP blacklisted for logging: ", srcIP, dstIP)
 		return
 	}
 
@@ -240,46 +230,26 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 		srcPodName = srcPodInfo.Name
 		srcNs = srcPodInfo.Namespace
 	}
+
 	if dstPodInfo != nil {
 		dstPodName = dstPodInfo.Name
 		dstNs = dstPodInfo.Namespace
 	}
 
 	if !filterer.ShouldTraceConnection(srcPodName, dstPodName, srcNs, dstNs) {
-		slog.Info("Should not trace connection: ", srcPodName, dstPodName, srcNs, dstNs)
 		return
 	}
 
-	// ⭐ Build connection key for correlation (client → server, using POD IPs only)
-	var clientIP, serverIP string
-	var clientPort, serverPort uint16
-
-	if isReq {
-		// Request egress: src=client, dst=server (might be service IP, but we need pod IP)
-		clientIP, clientPort = srcIP, chunk.SrcPort
-
-		// ⭐ If dstIP is a service IP (not in pod map), we can't correlate properly
-		// For now, use what we have - response will come from actual pod IP
-		serverIP, serverPort = dstIP, chunk.DstPort
-	} else {
-		// Response egress: src=server (pod IP), dst=client
-		clientIP, clientPort = dstIP, chunk.DstPort
-		serverIP, serverPort = srcIP, chunk.SrcPort
-	}
-
-	// ⭐ Create consistent connection key (always client → server)
+	// ⭐ Use socket pointer for correlation
 	connKey := events.ConnectionKey{
-		SrcIP:   clientIP,
-		SrcPort: clientPort,
-		DstIP:   serverIP,
-		DstPort: serverPort,
+		SockPtr: chunk.SockPtr,
 	}
 
 	// Deduplication check
 	dkey := dedupKey{
-		connKey:   connKey,
+		sockPtr:   chunk.SockPtr,
 		isRequest: isReq,
-		timestamp: entry.Timestamp.Truncate(100 * time.Millisecond).Unix(),
+		timestamp: time.Now().Truncate(100 * time.Millisecond).Unix(),
 	}
 
 	dedupMutex.Lock()
@@ -287,26 +257,15 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 		dedupMutex.Unlock()
 		return
 	}
+
 	dedupCache[dkey] = struct{}{}
 	dedupMutex.Unlock()
 
-	// ⭐ HTTP-level src/dst (for display purposes)
-	var httpSrc, httpDst string
-	if isReq {
-		httpSrc = watcher.GetPodURI(srcIP)
-		httpDst = watcher.GetPodURI(dstIP)
-	} else {
-		// Response: flip for display
-		httpSrc = watcher.GetPodURI(dstIP) // client
-		httpDst = watcher.GetPodURI(srcIP) // server
-	}
-
-	entry.Src = httpSrc
-	entry.Dst = httpDst
-
+	// ==================== REQUEST PROCESSING ====================
 	if isReq {
 		req, err := http.ReadRequest(bufferedReader)
 		if err != nil {
+			slog.Debug("Failed to parse HTTP request", "error", err)
 			return
 		}
 
@@ -319,14 +278,15 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 		}
 
 		bodyBytes, _ := io.ReadAll(req.Body)
+
 		headers := make(map[string]string)
 		for k, v := range req.Header {
 			headers[k] = strings.Join(v, ", ")
 		}
 
 		headers = output.RedactHeaders(headers)
-
 		contentEncoding := output.GetContentEncoding(headers)
+
 		decompressedBody, err := output.DecompressBody(bodyBytes, contentEncoding)
 		if err == nil {
 			bodyBytes = decompressedBody
@@ -334,49 +294,40 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 
 		body := output.TruncateBody(string(bodyBytes), 8192)
 
+		// ⭐ For REQUEST: src=client, dst=server (might be service IP)
+		clientURI := watcher.GetPodURI(srcIP)
+		serverURI := watcher.GetPodURI(dstIP)
+
 		pendingReq := &events.PendingRequest{
-			Timestamp:   entry.Timestamp,
+			Timestamp:   time.Now(),
 			Method:      req.Method,
 			URL:         req.URL.String(),
 			Headers:     headers,
 			Body:        body,
-			Src:         entry.Src,
-			Dst:         entry.Dst,
+			Src:         clientURI, // ⭐ Client pod who sent request
+			Dst:         serverURI, // ⭐ Will be updated when response arrives
 			IsEncrypted: false,
 		}
 
 		correlator.AddRequest(connKey, pendingReq)
 
-		entry.Type = "REQUEST"
-		entry.Method = req.Method
-		entry.URL = req.URL.String()
-		entry.Headers = headers
-		if len(body) > 0 {
-			entry.Body = body
-		}
+		slog.Debug("Request captured",
+			"method", req.Method,
+			"url", req.URL.String(),
+			"sock_ptr", chunk.SockPtr,
+			"src", clientURI,
+			"dst", serverURI,
+			"body_len", len(bodyBytes))
 
-		if os.Getenv("DEBUG_BODIES") == "1" {
-			slog.Info("Request captured",
-				"method", req.Method,
-				"url", req.URL.String(),
-				"body_len", len(bodyBytes),
-				"conn_key", fmt.Sprintf("%s:%d->%s:%d", connKey.SrcIP, connKey.SrcPort, connKey.DstIP, connKey.DstPort))
-		}
-
-		if err := writer.Write(entry); err != nil {
-			slog.Error("Error writing request trace", "error", err)
-		}
-
+		// ==================== RESPONSE PROCESSING ====================
 	} else if isResp {
 		resp, err := http.ReadResponse(bufferedReader, nil)
 		if err != nil {
-			slog.Warn("Failed to parse HTTP response", "error", err)
+			slog.Debug("Failed to parse HTTP response", "error", err)
 			return
 		}
 
-		// ⭐ Nil check before using resp
 		if resp == nil {
-			slog.Warn("HTTP response is nil")
 			return
 		}
 
@@ -388,8 +339,8 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 		}
 
 		headers = output.RedactHeaders(headers)
-
 		contentEncoding := output.GetContentEncoding(headers)
+
 		decompressedBody, err := output.DecompressBody(bodyBytes, contentEncoding)
 		if err == nil {
 			bodyBytes = decompressedBody
@@ -401,31 +352,31 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 			return
 		}
 
-		// Try to match with pending request
-		trace := correlator.MatchResponse(connKey, resp.Status, headers, respBody, entry.Timestamp)
+		// ⭐ For RESPONSE: srcIP = backend pod that sent response
+		backendPodURI := watcher.GetPodURI(srcIP)
+
+		// ⭐ Try to match with pending request using sock_ptr
+		trace := correlator.MatchResponse(connKey, resp.Status, headers, respBody, time.Now(), backendPodURI)
+
 		if trace != nil {
+			// ⭐ SUCCESS! Write the correlated trace
 			if err := writer.WriteCorrelated(trace); err != nil {
 				slog.Error("Error writing correlated trace", "error", err)
+			} else {
+				slog.Info("✅ Correlated trace written",
+					"method", trace.Method,
+					"url", trace.URL,
+					"status", trace.Status,
+					"duration_ms", trace.DurationMs,
+					"src", trace.Src, // ⭐ Client from request
+					"dst", trace.Dst, // ⭐ Backend from response
+					"sock_ptr", chunk.SockPtr)
 			}
 		} else {
-			// No matching request found
-			if os.Getenv("DEBUG_CORRELATOR") == "1" {
-				slog.Warn("No matching request found for response",
-					"key", fmt.Sprintf("%s:%d->%s:%d", connKey.SrcIP, connKey.SrcPort, connKey.DstIP, connKey.DstPort),
-					"status", resp.Status,
-					"pending_count", len(correlator.GetPending()))
-			}
-
-			entry.Type = "RESPONSE"
-			entry.Status = resp.Status
-			entry.Headers = headers
-			if len(respBody) > 0 {
-				entry.Body = respBody
-			}
-
-			if err := writer.Write(entry); err != nil {
-				slog.Error("Error writing trace", "error", err)
-			}
+			slog.Debug("No matching request for response",
+				"sock_ptr", chunk.SockPtr,
+				"status", resp.Status,
+				"backend", backendPodURI)
 		}
 	}
 }

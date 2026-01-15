@@ -372,12 +372,13 @@ int kretprobe_tcp_recvmsg(struct pt_regs *ctx) {
   e->timestamp = bpf_ktime_get_ns();
   e->pid = tid >> 32;
   e->tid = tid & 0xFFFFFFFF;
-  e->src_ip = conn->src_ip;
-  e->dst_ip = conn->dst_ip;
-  e->src_port = conn->src_port;
-  e->dst_port = conn->dst_port;
+  // ⭐ For INGRESS (response): swap src/dst because data flows FROM server TO client
+  e->src_ip = conn->dst_ip;   // Response comes FROM server (original dst)
+  e->dst_ip = conn->src_ip;   // Response goes TO client (original src)
+  e->src_port = conn->dst_port;
+  e->dst_port = conn->src_port;
   e->direction = DIR_INGRESS;
-  e->sock_ptr = sock_ptr; // ⭐ ADD THIS LINE
+  e->sock_ptr = sock_ptr;
 
   size_t len = copied;
   if (len > MAX_DATA_SIZE)

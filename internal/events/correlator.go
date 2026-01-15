@@ -2,18 +2,14 @@ package events
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 )
 
-// ConnectionKey uniquely identifies a TCP connection
+// ConnectionKey uniquely identifies a TCP connection using socket pointer
 type ConnectionKey struct {
-	SrcIP   string
-	SrcPort uint16
-	DstIP   string
-	DstPort uint16
+	SockPtr uint64
 }
 
 // PendingRequest stores request details waiting for response
@@ -27,7 +23,7 @@ type PendingRequest struct {
 	Headers       map[string]string
 	Body          string
 	Src           string
-	Dst           string
+	Dst           string // This will be Service IP initially
 	IsEncrypted   bool
 }
 
@@ -39,7 +35,7 @@ type CorrelatedTrace struct {
 	Status          string
 	DurationMs      int64
 	Src             string
-	Dst             string
+	Dst             string // ⭐ Will be updated to actual backend pod
 	RequestHeaders  map[string]string
 	RequestBody     string
 	ResponseHeaders map[string]string
@@ -66,9 +62,7 @@ func NewCorrelator(timeout time.Duration) *Correlator {
 		cancel:  cancel,
 	}
 
-	// Start cleanup goroutine
 	go c.cleanupLoop()
-
 	return c
 }
 
@@ -77,36 +71,31 @@ func (c *Correlator) AddRequest(key ConnectionKey, req *PendingRequest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pending[key] = req
+
+	slog.Debug("Added pending request",
+		"sock_ptr", key.SockPtr,
+		"method", req.Method,
+		"url", req.URL,
+		"dst", req.Dst)
 }
 
 // MatchResponse attempts to match a response with a pending request
-// Returns the correlated trace if found, nil otherwise
-func (c *Correlator) MatchResponse(key ConnectionKey, status string, respHeaders map[string]string, respBody string, timestamp time.Time) *CorrelatedTrace {
+// ⭐ serverURI: Actual backend pod URI from response source IP
+func (c *Correlator) MatchResponse(key ConnectionKey, status string, respHeaders map[string]string, respBody string, timestamp time.Time, serverURI string) *CorrelatedTrace {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	req, ok := c.pending[key]
 	if !ok {
-		// ⭐ Add debug logging
 		slog.Warn("No matching request found for response",
-			"key", fmt.Sprintf("%s:%d->%s:%d", key.SrcIP, key.SrcPort, key.DstIP, key.DstPort),
+			"sock_ptr", key.SockPtr,
 			"status", status,
 			"pending_count", len(c.pending))
-
-		// Show what keys we DO have
-		if len(c.pending) > 0 {
-			slog.Info("Currently pending requests:")
-			for k := range c.pending {
-				slog.Info("  Pending:", "key", fmt.Sprintf("%s:%d->%s:%d", k.SrcIP, k.SrcPort, k.DstIP, k.DstPort))
-			}
-		}
 		return nil
 	}
 
-	// Calculate duration
 	duration := timestamp.Sub(req.Timestamp).Milliseconds()
 
-	// Create correlated trace
 	trace := &CorrelatedTrace{
 		Timestamp:       req.Timestamp,
 		Method:          req.Method,
@@ -114,7 +103,7 @@ func (c *Correlator) MatchResponse(key ConnectionKey, status string, respHeaders
 		Status:          status,
 		DurationMs:      duration,
 		Src:             req.Src,
-		Dst:             req.Dst,
+		Dst:             serverURI, // ⭐ USE ACTUAL BACKEND POD FROM RESPONSE
 		RequestHeaders:  req.Headers,
 		RequestBody:     req.Body,
 		ResponseHeaders: respHeaders,
@@ -122,8 +111,14 @@ func (c *Correlator) MatchResponse(key ConnectionKey, status string, respHeaders
 		IsEncrypted:     req.IsEncrypted,
 	}
 
-	// Remove from pending
 	delete(c.pending, key)
+
+	slog.Debug("Matched request-response pair",
+		"sock_ptr", key.SockPtr,
+		"method", req.Method,
+		"status", status,
+		"duration_ms", duration,
+		"actual_server", serverURI)
 
 	return trace
 }
@@ -149,10 +144,16 @@ func (c *Correlator) cleanup() {
 	defer c.mu.Unlock()
 
 	now := time.Now()
+	cleaned := 0
 	for key, req := range c.pending {
 		if now.Sub(req.Timestamp) > c.timeout {
 			delete(c.pending, key)
+			cleaned++
 		}
+	}
+
+	if cleaned > 0 {
+		slog.Debug("Cleaned up stale requests", "count", cleaned)
 	}
 }
 
@@ -166,10 +167,10 @@ func (c *Correlator) GetPending() map[ConnectionKey]*PendingRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Return a copy to avoid race conditions
 	pending := make(map[ConnectionKey]*PendingRequest, len(c.pending))
 	for k, v := range c.pending {
 		pending[k] = v
 	}
+
 	return pending
 }

@@ -17,12 +17,13 @@ type DataEvent struct {
 	DstPort   uint16
 	DataLen   uint32
 	Direction uint8 // 0=Egress, 1=Ingress
+	SockPtr   uint64 // ⭐ ADDED
 	Payload   []byte
 }
 
 // ParseDataEvent parses raw bytes into a DataEvent
 func ParseDataEvent(data []byte) (*DataEvent, error) {
-	// Helper offsets
+	// Struct layout (with sock_ptr):
 	// timestamp: 0-8
 	// pid: 8-12
 	// tid: 12-16
@@ -32,10 +33,14 @@ func ParseDataEvent(data []byte) (*DataEvent, error) {
 	// dst_port: 26-28
 	// data_len: 28-32
 	// direction: 32-33
-	// payload: 33-...
+	// _pad[7]: 33-40
+	// sock_ptr: 40-48  ⭐ ADDED
+	// payload: 48-...  ⭐ MOVED FROM 33
 
-	if len(data) < 33 {
-		return nil, fmt.Errorf("data too short: %d bytes", len(data))
+	const headerSize = 48 // ⭐ CHANGED FROM 33
+
+	if len(data) < headerSize {
+		return nil, fmt.Errorf("data too short: %d bytes, need at least %d", len(data), headerSize)
 	}
 
 	event := &DataEvent{}
@@ -48,10 +53,10 @@ func ParseDataEvent(data []byte) (*DataEvent, error) {
 	event.DstPort = binary.LittleEndian.Uint16(data[26:28])
 	event.DataLen = binary.LittleEndian.Uint32(data[28:32])
 	event.Direction = data[32]
+	// Skip _pad[7] at bytes 33-40
+	event.SockPtr = binary.LittleEndian.Uint64(data[40:48]) // ⭐ ADDED
 
-	const headerSize = 33
-	// max payload size defined in C is 4096 (but ringbuffer might be smaller if data is small)
-
+	// Read payload
 	if len(data) > headerSize {
 		// Cap validation
 		if uint32(len(data)-headerSize) < event.DataLen {
@@ -66,8 +71,7 @@ func ParseDataEvent(data []byte) (*DataEvent, error) {
 	return event, nil
 }
 
-// Helper methods from event.go reused...
-
+// Helper methods
 func (e *DataEvent) SrcIPString() string {
 	return intToIP(e.SrcIP).String()
 }
@@ -79,3 +83,4 @@ func (e *DataEvent) DstIPString() string {
 func (e *DataEvent) Time() time.Time {
 	return time.Unix(0, int64(e.Timestamp))
 }
+
