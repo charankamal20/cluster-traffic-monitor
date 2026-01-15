@@ -31,11 +31,11 @@ run: build
 
 
 image: 
-	@docker build -t classikh/http-tracer:v4 .
+	@docker build -t classikh/http-tracer:v7 .
 
 
 push: image
-	@docker push classikh/http-tracer:v4
+	@docker push classikh/http-tracer:v7
 
 deploy: 
 	@kubectl apply -f k8s/serviceaccount.yaml

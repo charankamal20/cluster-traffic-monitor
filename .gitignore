@@ -12,6 +12,8 @@ bin/
 *.swp
 *~
 *.log
+*.docx
+tracer
 
 # Go
 vendor/

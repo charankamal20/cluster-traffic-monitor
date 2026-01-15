@@ -32,14 +32,16 @@ type bpf_fullDataEvent struct {
 	DstPort   uint16
 	DataLen   uint32
 	Direction uint8
+	Pad       [7]uint8
+	SockPtr   uint64
 	Payload   [4096]uint8
-	_         [7]byte
 }
 
 type bpf_fullRecvArgs struct {
-	_   structs.HostLayout
-	Sk  uint64
-	Msg uint64
+	_         structs.HostLayout
+	Sk        uint64
+	IovBase   uint64
+	IovOffset uint64
 }
 
 // loadBpf_full returns the embedded CollectionSpec for bpf_full.
@@ -95,10 +97,11 @@ type bpf_fullProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpf_fullMapSpecs struct {
-	ActiveRecv   *ebpf.MapSpec `ebpf:"active_recv"`
-	Connections  *ebpf.MapSpec `ebpf:"connections"`
-	EventScratch *ebpf.MapSpec `ebpf:"event_scratch"`
-	Events       *ebpf.MapSpec `ebpf:"events"`
+	ActiveRecv            *ebpf.MapSpec `ebpf:"active_recv"`
+	ConnectionFilterCache *ebpf.MapSpec `ebpf:"connection_filter_cache"`
+	Connections           *ebpf.MapSpec `ebpf:"connections"`
+	EventScratch          *ebpf.MapSpec `ebpf:"event_scratch"`
+	Events                *ebpf.MapSpec `ebpf:"events"`
 }
 
 // bpf_fullVariableSpecs contains global variables before they are loaded into the kernel.
@@ -127,15 +130,17 @@ func (o *bpf_fullObjects) Close() error {
 //
 // It can be passed to loadBpf_fullObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpf_fullMaps struct {
-	ActiveRecv   *ebpf.Map `ebpf:"active_recv"`
-	Connections  *ebpf.Map `ebpf:"connections"`
-	EventScratch *ebpf.Map `ebpf:"event_scratch"`
-	Events       *ebpf.Map `ebpf:"events"`
+	ActiveRecv            *ebpf.Map `ebpf:"active_recv"`
+	ConnectionFilterCache *ebpf.Map `ebpf:"connection_filter_cache"`
+	Connections           *ebpf.Map `ebpf:"connections"`
+	EventScratch          *ebpf.Map `ebpf:"event_scratch"`
+	Events                *ebpf.Map `ebpf:"events"`
 }
 
 func (m *bpf_fullMaps) Close() error {
 	return _Bpf_fullClose(
 		m.ActiveRecv,
+		m.ConnectionFilterCache,
 		m.Connections,
 		m.EventScratch,
 		m.Events,

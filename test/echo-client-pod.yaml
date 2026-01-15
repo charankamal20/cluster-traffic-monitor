@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-client
+  labels:
+    app: echo-client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-client
+  template:
+    metadata:
+      labels:
+        app: echo-client
+    spec:
+      containers:
+        - name: client
+          image: curlimages/curl:8.6.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "GET:"
+              curl -s http://echo-server:8080/health
+
+              echo "\nPOST:"
+              curl -s -X POST \
+                -H "Content-Type: application/json" \
+                -d '{"action":"create","source":"echo-client"}' \
+                http://echo-server:8080/test
+
+              echo "\nPUT:"
+              curl -s -X PUT \
+                -H "Content-Type: application/json" \
+                -d '{"action":"update","id":123}' \
+                http://echo-server:8080/resource
+
+              echo "\nDELETE:"
+              curl -s -X DELETE \
+                -H "Content-Type: application/json" \
+                -d '{"action":"delete","id":123}' \
+                http://echo-server:8080/resource
+
+              echo "\nPATCH:"
+              curl -s -X PATCH \
+                -H "Content-Type: application/json" \
+                -d '{"op":"replace","field":"name","value":"new-name"}' \
+                http://echo-server:8080/resource
+
+              echo "\nOPTIONS:"
+              curl -s -X OPTIONS http://echo-server:8080/
+
+              echo "\n----"
+              sleep 5
+
+              while true; do
+                sleep 60
+              done
+
