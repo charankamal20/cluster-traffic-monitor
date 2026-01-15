@@ -23,11 +23,12 @@ type PodInfo struct {
 
 // Watcher monitors K8s pods and maintains an IP -> PodInfo map
 type Watcher struct {
-	client     *kubernetes.Clientset
-	podMap     map[string]*PodInfo // IP -> PodInfo
-	serviceMap map[string][]string // IP -> []ServiceNames
-	mu         sync.RWMutex
-	stopCh     chan struct{}
+	client       *kubernetes.Clientset
+	podMap       map[string]*PodInfo // Pod IP -> PodInfo
+	serviceMap   map[string][]string // Pod IP -> []ServiceNames (from Endpoints)
+	serviceIPMap map[string]string   // Service ClusterIP -> "namespace/servicename"
+	mu           sync.RWMutex
+	stopCh       chan struct{}
 }
 
 // NewWatcher creates a new K8s watcher
@@ -45,23 +46,27 @@ func NewWatcher() (*Watcher, error) {
 	}
 
 	return &Watcher{
-		client:     clientset,
-		podMap:     make(map[string]*PodInfo),
-		serviceMap: make(map[string][]string),
-		stopCh:     make(chan struct{}),
+		client:       clientset,
+		podMap:       make(map[string]*PodInfo),
+		serviceMap:   make(map[string][]string),
+		serviceIPMap: make(map[string]string),
+		stopCh:       make(chan struct{}),
 	}, nil
 }
 
-// Start begins watching pods and endpoints
+// Start begins watching pods, services, and endpoints
 func (w *Watcher) Start(ctx context.Context) error {
-	slog.Info("Starting K8s Watcher (Pods & Endpoints)...")
+	slog.Info("Starting K8s Watcher (Pods, Services & Endpoints)...")
 
 	// 1. Pods
 	if err := w.startPodWatcher(ctx); err != nil {
 		return err
 	}
 
-	// 2. Endpoints
+	// 2. Services (for ClusterIP resolution)
+	go w.startServiceWatcher(ctx)
+
+	// 3. Endpoints
 	go w.startEndpointWatcher(ctx)
 
 	return nil
@@ -180,6 +185,65 @@ func (w *Watcher) startEndpointWatcher(ctx context.Context) {
 	}
 }
 
+// startServiceWatcher watches Service resources to track ClusterIPs
+func (w *Watcher) startServiceWatcher(ctx context.Context) {
+	// Initial List
+	svcs, err := w.client.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		slog.Warn("Error listing services", "error", err)
+	} else {
+		w.mu.Lock()
+		for _, svc := range svcs.Items {
+			w.updateService(&svc)
+		}
+		w.mu.Unlock()
+		slog.Info("Initial service cache built", "count", len(svcs.Items))
+	}
+
+	resourceVersion := ""
+	if svcs != nil {
+		resourceVersion = svcs.ResourceVersion
+	}
+
+	// Watch loop
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			watchOpts := metav1.ListOptions{
+				Watch:           true,
+				ResourceVersion: resourceVersion,
+			}
+			watcher, err := w.client.CoreV1().Services("").Watch(ctx, watchOpts)
+			if err != nil {
+				slog.Warn("Error watching services, retrying...", "error", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			for event := range watcher.ResultChan() {
+				svc, ok := event.Object.(*corev1.Service)
+				if !ok {
+					continue
+				}
+
+				// Update ResourceVersion
+				resourceVersion = svc.ResourceVersion
+
+				w.mu.Lock()
+				switch event.Type {
+				case "ADDED", "MODIFIED":
+					w.updateService(svc)
+				case "DELETED":
+					w.deleteService(svc)
+				}
+				w.mu.Unlock()
+			}
+		}
+	}
+}
+
 func (w *Watcher) updatePod(pod *corev1.Pod) {
 	if pod.Status.PodIP != "" {
 		w.podMap[pod.Status.PodIP] = &PodInfo{
@@ -255,6 +319,24 @@ func (w *Watcher) addServiceToIP(ip, svc string) {
 	w.serviceMap[ip] = append(services, svc)
 }
 
+// updateService tracks Service ClusterIP
+func (w *Watcher) updateService(svc *corev1.Service) {
+	// Only track ClusterIP services (not NodePort, LoadBalancer, etc.)
+	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
+		return
+	}
+
+	svcName := fmt.Sprintf("%s/%s", svc.Namespace, svc.Name)
+	w.serviceIPMap[svc.Spec.ClusterIP] = svcName
+}
+
+// deleteService removes Service ClusterIP from tracking
+func (w *Watcher) deleteService(svc *corev1.Service) {
+	if svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != "None" {
+		delete(w.serviceIPMap, svc.Spec.ClusterIP)
+	}
+}
+
 // GetPodByIP returns pod info for a given IP
 func (w *Watcher) GetPodByIP(ip string) *PodInfo {
 	w.mu.RLock()
@@ -280,7 +362,12 @@ func (w *Watcher) GetPodURI(ip string) string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	// 1. Try Service
+	// 1. Try Service ClusterIP first (most common for destinations)
+	if svcName, ok := w.serviceIPMap[ip]; ok {
+		return fmt.Sprintf("svc:%s", svcName)
+	}
+
+	// 2. Try Endpoint-based service (pod IP with service)
 	if svcs, ok := w.serviceMap[ip]; ok && len(svcs) > 0 {
 		// Return first service + pod name hint if available
 		svc := svcs[0] // Just pick first
@@ -290,7 +377,7 @@ func (w *Watcher) GetPodURI(ip string) string {
 		return fmt.Sprintf("svc:%s", svc)
 	}
 
-	// 2. Try Pod
+	// 3. Try Pod only
 	if info, ok := w.podMap[ip]; ok {
 		return fmt.Sprintf("%s/%s", info.Namespace, info.Name)
 	}

@@ -279,6 +279,12 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 
 		bodyBytes, _ := io.ReadAll(req.Body)
 
+		slog.Debug("Request body captured",
+			"method", req.Method,
+			"url", req.URL.String(),
+			"body_len", len(bodyBytes),
+			"content_type", req.Header.Get("Content-Type"))
+
 		headers := make(map[string]string)
 		for k, v := range req.Header {
 			headers[k] = strings.Join(v, ", ")
