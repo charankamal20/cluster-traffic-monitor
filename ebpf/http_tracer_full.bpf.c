@@ -107,18 +107,68 @@ static __always_inline void fill_connection_info(struct conn_info *info,
 // 1. Connection Tracking (tracepoint)
 SEC("tracepoint/sock/inet_sock_set_state")
 int trace_inet_sock_set_state(struct inet_sock_set_state_args *ctx) {
-  if (ctx->family != AF_INET)
+  if (ctx->family != AF_INET &&
+      ctx->family != 10) { // Allow AF_INET and AF_INET6
     return 0;
+  }
 
   __u64 sock_ptr = (__u64)ctx->skaddr;
 
   if (ctx->newstate == TCP_ESTABLISHED) {
     struct conn_info info = {};
-    __builtin_memcpy(&info.src_ip, ctx->saddr, 4);
-    __builtin_memcpy(&info.dst_ip, ctx->daddr, 4);
+
+    if (ctx->family == 10) { // AF_INET6
+      __u8 s6[16];
+      __u8 d6[16];
+      // Manual offset reading to bypass verifier ctx restrictions
+      // saddr_v6 is at offset 40, daddr_v6 at 56
+      unsigned long ctx_addr = (unsigned long)ctx;
+      bpf_probe_read(s6, 16, (void *)(ctx_addr + 40));
+      bpf_probe_read(d6, 16, (void *)(ctx_addr + 56));
+
+      // Check for IPv4-mapped: ::ffff:x.x.x.x
+      // First 10 bytes must be 0, bytes 10-11 must be 0xff
+      int is_v4_mapped = 1;
+#pragma unroll
+      for (int i = 0; i < 10; i++) {
+        if (s6[i] != 0 || d6[i] != 0) {
+          is_v4_mapped = 0;
+          break;
+        }
+      }
+
+      if (is_v4_mapped && s6[10] == 0xff && s6[11] == 0xff) {
+        __builtin_memcpy(&info.src_ip, &s6[12], 4);
+        __builtin_memcpy(&info.dst_ip, &d6[12], 4);
+      } else {
+        return 0; // Ignore non-IPv4 traffic for now
+      }
+    } else {
+      // AF_INET
+      __builtin_memcpy(&info.src_ip, ctx->saddr, 4);
+      __builtin_memcpy(&info.dst_ip, ctx->daddr, 4);
+    }
+
     info.src_port = ctx->sport;
     info.dst_port = ctx->dport;
     bpf_map_update_elem(&connections, &sock_ptr, &info, BPF_ANY);
+
+    // DEBUG: Send event for connection establishment
+    __u32 key = 0;
+    struct data_event *e = bpf_map_lookup_elem(&event_scratch, &key);
+    if (e) {
+      e->timestamp = bpf_ktime_get_ns();
+      e->pid = bpf_get_current_pid_tgid() >> 32;
+      e->tid = bpf_get_current_pid_tgid() & 0xFFFFFFFF;
+      e->src_ip = info.src_ip;
+      e->dst_ip = info.dst_ip;
+      e->src_port = info.src_port;
+      e->dst_port = info.dst_port;
+      e->data_len = 0;
+      e->direction = 2; // DEBUG: Connection Established
+      e->sock_ptr = sock_ptr;
+      bpf_ringbuf_output(&events, e, sizeof(*e) - MAX_DATA_SIZE, 0);
+    }
   } else if (ctx->newstate == TCP_CLOSE) {
     bpf_map_delete_elem(&connections, &sock_ptr);
   }
@@ -372,9 +422,10 @@ int kretprobe_tcp_recvmsg(struct pt_regs *ctx) {
   e->timestamp = bpf_ktime_get_ns();
   e->pid = tid >> 32;
   e->tid = tid & 0xFFFFFFFF;
-  // ⭐ For INGRESS (response): swap src/dst because data flows FROM server TO client
-  e->src_ip = conn->dst_ip;   // Response comes FROM server (original dst)
-  e->dst_ip = conn->src_ip;   // Response goes TO client (original src)
+  // ⭐ For INGRESS (response): swap src/dst because data flows FROM server TO
+  // client
+  e->src_ip = conn->dst_ip; // Response comes FROM server (original dst)
+  e->dst_ip = conn->src_ip; // Response goes TO client (original src)
   e->src_port = conn->dst_port;
   e->dst_port = conn->src_port;
   e->direction = DIR_INGRESS;

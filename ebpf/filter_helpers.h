@@ -15,6 +15,7 @@
 #define HTTP_INT 0x50545448 // "HTTP"
 #define HEAD_INT 0x44414548 // "HEAD"
 #define PATC_INT 0x43544150 // "PATC" (PATCH)
+#define OPTI_INT 0x4954504F // "OPTI" (OPTIONS)
 
 // Health check detection
 static __always_inline int is_http_traffic(const char *buf, __u32 len) {
@@ -29,7 +30,8 @@ static __always_inline int is_http_traffic(const char *buf, __u32 len) {
   // Check HTTP methods
   if (first_word == GET_INT || first_word == POST_INT ||
       first_word == PUT_INT || first_word == DEL_INT ||
-      first_word == HEAD_INT || first_word == PATC_INT) {
+      first_word == HEAD_INT || first_word == PATC_INT ||
+      first_word == OPTI_INT) {
     return 1;
   }
 

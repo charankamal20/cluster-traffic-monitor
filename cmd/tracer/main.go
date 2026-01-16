@@ -43,7 +43,7 @@ var (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: slog.LevelDebug,
 	}))
 	slog.SetDefault(logger)
 
@@ -265,15 +265,29 @@ func processCompleteMessage(data []byte, chunk *events.DataEvent, watcher *k8s.W
 	if isReq {
 		req, err := http.ReadRequest(bufferedReader)
 		if err != nil {
-			slog.Debug("Failed to parse HTTP request", "error", err)
+			slog.Debug("Failed to parse HTTP request", "error", err, "src", chunk.SrcIPString(), "dst", chunk.DstIPString())
 			return
 		}
 
+		slog.Debug("HTTP request parsed successfully",
+			"method", req.Method,
+			"url", req.URL.String(),
+			"src", chunk.SrcIPString(),
+			"dst", chunk.DstIPString())
+
 		if filterer.IsHealthProbe(req.URL.Path, req.UserAgent(), "") {
+			slog.Debug("Request filtered: health probe",
+				"method", req.Method,
+				"url", req.URL.String(),
+				"user_agent", req.UserAgent())
 			return
 		}
 
 		if !filterer.ShouldTraceRequest(req.URL.Path, req.UserAgent()) {
+			slog.Debug("Request filtered: should not trace",
+				"method", req.Method,
+				"url", req.URL.String(),
+				"user_agent", req.UserAgent())
 			return
 		}
 
