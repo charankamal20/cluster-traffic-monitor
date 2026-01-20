@@ -35,7 +35,7 @@ type CorrelatedTrace struct {
 	Status          string
 	DurationMs      int64
 	Src             string
-	Dst             string // ⭐ Will be updated to actual backend pod
+	Dst             string //  Will be updated to actual backend pod
 	RequestHeaders  map[string]string
 	RequestBody     string
 	ResponseHeaders map[string]string
@@ -80,7 +80,7 @@ func (c *Correlator) AddRequest(key ConnectionKey, req *PendingRequest) {
 }
 
 // MatchResponse attempts to match a response with a pending request
-// ⭐ serverURI: Actual backend pod URI from response source IP
+//  serverURI: Actual backend pod URI from response source IP
 func (c *Correlator) MatchResponse(key ConnectionKey, status string, respHeaders map[string]string, respBody string, timestamp time.Time, serverURI string) *CorrelatedTrace {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -103,7 +103,7 @@ func (c *Correlator) MatchResponse(key ConnectionKey, status string, respHeaders
 		Status:          status,
 		DurationMs:      duration,
 		Src:             req.Src,
-		Dst:             serverURI, // ⭐ USE ACTUAL BACKEND POD FROM RESPONSE
+		Dst:             serverURI, //  USE ACTUAL BACKEND POD FROM RESPONSE
 		RequestHeaders:  req.Headers,
 		RequestBody:     req.Body,
 		ResponseHeaders: respHeaders,

@@ -132,6 +132,36 @@ func (fw *FileWriter) WriteCorrelated(trace *events.CorrelatedTrace) error {
 	return err
 }
 
+// IgnoredTraceEntry represents an orphaned response with metadata
+type IgnoredTraceEntry struct {
+	Timestamp       time.Time         `json:"timestamp"`
+	Status          string            `json:"status"`
+	SockPtr         uint64            `json:"sock_ptr"`
+	Src             string            `json:"src"`
+	Dst             string            `json:"dst"`
+	ResponseHeaders map[string]string `json:"response_headers,omitempty"`
+	ResponseBody    string            `json:"response_body,omitempty"`
+}
+
+// WriteIgnored writes an ignored trace entry
+func (fw *FileWriter) WriteIgnored(entry IgnoredTraceEntry) error {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+
+	// Write NDJSON
+	_, err = fw.writer.Write(data)
+	if err != nil {
+		return err
+	}
+	_, err = fw.writer.Write([]byte("\n"))
+	return err
+}
+
 func (fw *FileWriter) flushLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
